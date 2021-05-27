@@ -1,3 +1,10 @@
+# The code is aimed towards uploading a batch of pdf files from local to GCS and if there are any duplicate files present in any of the batch
+# the code should throw an exception
+# If there are no duplicate files in a given batch that are already present in the GCS, the files will be uploaded to the new batch folder in the bucket
+# The code can also be used to download multiple files as zip using a valid batch id
+# The code also has an API to get the current number of files that are present in the GCS
+# The entire opertaion is made possible using Flask API, GCS, CLoud SQL
+
 from flask import Flask, jsonify, request, redirect, make_response, send_file
 from functools import wraps
 import uuid
@@ -13,8 +20,11 @@ import shutil
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+
+# Add a new secret key for flask to work. Keep it confidential
 app.config['SECRET_KEY'] = <secret_key>
 
+# give the CLoud SQL Connection parameters
 app.config["MYSQL_DATABASE_USER"] = <username>
 app.config["MYSQL_DATABASE_PASSWORD"] = <password>
 app.config["MYSQL_DATABASE_DB"] = <database>
