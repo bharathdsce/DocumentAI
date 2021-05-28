@@ -35,7 +35,6 @@ app.config["INPUT_GCS_BUCKET"] = <gcs_bucket>
 ALLOWED_EXTENSIONS = ['pdf']
 platform_type = platform.system()
 
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -71,7 +70,6 @@ def duplicate_data_struct(db_data):
             data_dict[temp_batch_id] = [temp_file_id]
         else:
             data_dict[temp_batch_id].append(temp_file_id)
-    print(data_dict)
     return data_dict
 
 def token_required(f):
@@ -79,7 +77,8 @@ def token_required(f):
     def decorated(*args, **kwargs):
         token = request.args.get('token')
         if not token:
-            return jsonify({'message': 'Token is missing'}), 403
+            return jsonify({'Message': 'Unauthorized',
+                            "Description": "Token is missing"}), 401
         try:
             jwt.decode(token, app.config['SECRET_KEY'])
         except Exception as e:
@@ -97,7 +96,7 @@ def upload_file_gcs():
 
         files = request.files.getlist('files')
         batch_id = str(uuid.uuid1())
-        print("batch_id = {}".format(batch_id))
+
         storage_client = storage.Client()
         storage_bucket = storage_client.get_bucket(app.config["INPUT_GCS_BUCKET"])
         batch_id_list = []
@@ -108,6 +107,7 @@ def upload_file_gcs():
         batch_start_dttm = datetime.datetime.now()
         file_count = 0
         file_names = []
+        gcs_uri_list = []
 
         FactFileStatusTable = "FactFileStatus"
         FactFileInfoTable = "FactFileInfo"
@@ -118,15 +118,16 @@ def upload_file_gcs():
             file_names.append(file.filename)
 
         file_names_str = "'" + "','".join(file_names) + "'"
-        print(file_names_str)
         db_conn = create_db_conn().connect()
         db_data = db_conn.execute(
             "select count(*) as file_num from {} where FileID in ({})".format(FactFileStatusTable, file_names_str))
         num_file_db = [row for row in db_data][0][0]
-        print("num_file_db", num_file_db)
         db_conn.close()
+
         if num_file_db == 0:
+            print("batch_id = {}".format(batch_id))
             file_names = []
+            batch_id_uri = "gs://{}/".format(app.config["INPUT_GCS_BUCKET"])
             for file in files:
                 file_count += 1
                 if file and allowed_file(file.filename):
@@ -135,6 +136,8 @@ def upload_file_gcs():
                     blob = storage_bucket.blob(batch_id + "/" + file.filename)
                     blob.upload_from_string(file.read(), content_type=file.content_type)
                     end_time = datetime.datetime.now()
+
+                    gcs_uri_list.append(batch_id_uri+blob.name)
                     batch_id_list.append(batch_id)
                     file_id_list.append(file.filename)
                     status_id_list.append(1)
@@ -142,7 +145,7 @@ def upload_file_gcs():
                     process_end_dttm_list.append(end_time)
 
                 else:
-                    return jsonify({'message': 'Invalid Filetype'}), 400
+                    return jsonify({'message': 'Invalid Filetype'}), 415
 
             upload_file_data = {"BatchID": batch_id_list,
                                 "FileID": file_id_list,
@@ -150,7 +153,8 @@ def upload_file_gcs():
                                 "ProcessStartDtTm": process_start_dttm_list,
                                 "ProcessEndDtTm": [None]*file_count,
                                 "LastModifiedDtTm": [datetime.datetime.now()]*file_count,
-                                "LastModifiedBy": ["API"]*file_count}
+                                "LastModifiedBy": ["API"]*file_count,
+                                "GcsUri": gcs_uri_list}
 
             upload_batch_status_data = {"BatchID": [batch_id],
                                         "StatusID": [1],
@@ -158,7 +162,8 @@ def upload_file_gcs():
                                         "BatchEndDtTm": [None],
                                         "TotalFiles": [file_count],
                                         "LastModifiedDtTm": [datetime.datetime.now()],
-                                        "LastModifiedBy": ["API"]}
+                                        "LastModifiedBy": ["API"],
+                                        "GcsUri": [batch_id_uri+batch_id]}
 
             upload_batch_info_data = {"BatchID": [batch_id],
                                       "ProcessStartDtTm": [batch_start_dttm],
@@ -175,13 +180,15 @@ def upload_file_gcs():
             try:
                 db_conn = create_db_conn().connect()
             except Exception as e:
-                return jsonify({"Error": str(e)}), 400
+                return jsonify({"Message": "Internal Server Error",
+                                "Description": str(e)}), 500
 
             try:
                 batch_status_df.to_sql(BatchStatusTable, db_conn, if_exists='append', index=False)
                 fact_file_df.to_sql(FactFileStatusTable, db_conn, if_exists='append', index=False)
                 fact_file_df["Description"] = ["Upload Completed"]*file_count
                 fact_file_df["ProcessEndDtTm"] = process_end_dttm_list
+                fact_file_df.drop(["GcsUri"], axis=1, inplace=True)
                 fact_file_df.to_sql(FactFileInfoTable, db_conn, if_exists='append', index=False)
                 batch_info_df.to_sql(BatchInfoTable, db_conn, if_exists='append', index=False)
 
@@ -194,7 +201,6 @@ def upload_file_gcs():
 
         else:
             file_names_str = "'"+"','".join(file_names)+"'"
-            print(file_names_str)
             db_conn = create_db_conn().connect()
             db_data = db_conn.execute("select BatchID, FileID from {} where FileID in ({})".format(FactFileStatusTable, file_names_str))
             db_conn.close()
@@ -203,24 +209,21 @@ def upload_file_gcs():
 
             return jsonify({"Exception": "Duplicate Files",
                             "Message": "Following files are already present in the system",
-                            "Files": data_dict})
+                            "Files": data_dict}), 409
 
-        return jsonify({"status": "Success", "Batch ID": batch_id, "Files Uploaded": file_count})
+        return jsonify({"status": "Success", "Batch ID": batch_id, "Files Uploaded": file_count}), 200
 
 @app.route('/api/download_gcs', methods=['GET'])
 @token_required
 def download_file_gcs():
-    # print(request.form.to_dict())
-    # print(request.json)
     batch_id = request.args["batch_id"]
     print("batch_id = ", batch_id)
     batch_status_tb = "FactBatchStatus"
 
     db_conn = create_db_conn().connect()
     db_data = db_conn.execute(
-        "select count(*) as batch_num from {} where BatchID='{}'".format(batch_status_tb, batch_id))
+        "select count(*) as batch_num from {} where BatchID='{}' and StatusID<>3".format(batch_status_tb, batch_id))
     num_batch_db = [row for row in db_data][0][0]
-    # print("num_file_db = ", num_batch_db)
     db_conn.close()
 
     if num_batch_db != 0:
@@ -233,15 +236,86 @@ def download_file_gcs():
         for blob in blobs:
             filename = blob.name.split("/")[-1]
             blob.download_to_filename(os.path.join(temp_folder1, filename))
-            # print(os.path.join(temp_folder1, filename))
 
-        # print(os.path.join(temp_folder2, batch_id))
         shutil.make_archive(os.path.join(temp_folder2, batch_id), 'zip', temp_folder1)
 
         return send_file(os.path.join(temp_folder2, batch_id)+".zip")
 
     else:
-        return jsonify({"message": "The given Batch ID is not valid", "Batch ID": batch_id})
+        return jsonify({"message": "The given Batch ID is not valid",
+                        "Batch ID": batch_id,
+                        "Suggestion": "The Batch might be deleted"}), 404
+
+@app.route('/api/delete_gcs', methods=['DELETE'])
+@token_required
+def delete_blob_gcs():
+    batch_id = request.args["batch_id"]
+    print("batch_id = ", batch_id)
+    file_status_tb = "FactFileStatus"
+    file_info_tb = "FactFileInfo"
+    batch_status_tb = "FactBatchStatus"
+    batch_info_table = "FactBatchInfo"
+
+    db_conn = create_db_conn().connect()
+    db_data = db_conn.execute(
+        "select count(*) as batch_num from {} where "
+        "BatchID='{}' and StatusID=1".format(batch_status_tb, batch_id))
+    num_batch_db = [row for row in db_data][0][0]
+    db_conn.close()
+
+    if num_batch_db != 0:
+        storage_client = storage.Client()
+        bucket = storage_client.get_bucket(app.config["INPUT_GCS_BUCKET"])
+
+        blobs = bucket.list_blobs(prefix='{}/'.format(batch_id))
+        counter = 0
+        db_conn = create_db_conn().connect()
+        batch_start_dt_tm = datetime.datetime.now()
+        for blob in blobs:
+            file_start_dt_tm = datetime.datetime.now()
+            file_id = blob.name.split("/")[-1]
+            blob.delete()
+            file_end_dt_tm = datetime.datetime.now()
+            counter += 1
+            db_conn.execute(
+                "update {} "
+                "set StatusID=3, ProcessEndDtTm='{}' "
+                "where "
+                "FileID='{}' and StatusID=1".format(file_status_tb, file_end_dt_tm, file_id))
+
+            db_conn.execute(
+                "insert into {}(BatchID, FileID, ProcessStartDtTm, "
+                "ProcessEndDtTm, StatusID, LastModifiedDtTm, LastModifiedBy, Description) "
+                "values('{}', '{}', '{}', '{}', {}, '{}', '{}', '{}')".format(file_info_tb, batch_id, file_id,
+                                                        file_start_dt_tm, file_end_dt_tm,
+                                                        3, datetime.datetime.now(), "API",
+                                                        "Data purged"))
+
+        batch_end_dt_tm = datetime.datetime.now()
+        db_conn.execute(
+            "update {} "
+            "set StatusID=3, BatchEndDtTm='{}' "
+            "where "
+            "BatchID='{}' and StatusID=1".format(batch_status_tb, batch_end_dt_tm, batch_id))
+
+        db_conn.execute(
+            "insert into {}(BatchID, ProcessStartDtTm, "
+            "ProcessEndDtTm, StatusID, LastModifiedDtTm, LastModifiedBy, Description) "
+            "values('{}', '{}', '{}', {}, '{}', '{}', '{}')".format(batch_info_table, batch_id,
+                                                                          batch_start_dt_tm, batch_end_dt_tm,
+                                                                          3, datetime.datetime.now(), "API",
+                                                                          "Data purged"))
+        db_conn.close()
+
+        return jsonify({"Message": "Files Deleted",
+                        "Batch ID": batch_id,
+                        "Files Deleted": counter}), 200
+
+    else:
+        return jsonify({"Message": "Invalid Batch ID",
+                        "Batch ID": batch_id,
+                        "Description": "Batch ID: {} not found".format(batch_id),
+                        "Suggestion": "The Batch might be deleted"}), 404
 
 @app.route("/api/current_doc", methods=["GET"])
 @token_required
@@ -249,12 +323,21 @@ def current_doc():
     db_conn = create_db_conn().connect()
     data = db_conn.execute("select count(1) as current_docs from FactFileStatus where StatusID=1")
     data_dict = [(dict(row.items())) for row in data][0]
-    print(data_dict)
+
+    doc_count = data_dict["current_docs"]
+
+    db_data = db_conn.execute("select BatchID, FileID from FactFileStatus where StatusID=1")
+    data_dict = duplicate_data_struct(db_data)
     db_conn.close()
-    resp = jsonify(data_dict)
+    resp = jsonify({"Current Docs": doc_count,
+                    "File Info": data_dict})
 
     resp.status_code = 200
     return resp
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({"message": 'File Too Large', "Error": error}), 413
 
 @app.route('/api/login')
 def apiLogin():
@@ -271,4 +354,4 @@ def home():
     return jsonify({'message': 'Success'}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
